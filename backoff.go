@@ -2,63 +2,61 @@ package outbox
 
 import (
 	"math"
-	"math/rand"
 	"time"
 )
 
-// BackoffStrategy определяет функцию для вычисления задержки между попытками
-type BackoffStrategy func(attempt int) time.Duration
-
-// ExponentialBackoffWithJitter создает стратегию экспоненциального бэкоффа с джиттером
-func ExponentialBackoffWithJitter(baseDelay time.Duration, maxDelay time.Duration) BackoffStrategy {
-	return func(attempt int) time.Duration {
-		if attempt <= 0 {
-			return baseDelay
-		}
-
-		// Экспоненциальная задержка: baseDelay * 2^(attempt-1)
-		exponentialDelay := float64(baseDelay) * math.Pow(2, float64(attempt-1))
-		
-		// Ограничиваем максимальной задержкой
-		if exponentialDelay > float64(maxDelay) {
-			exponentialDelay = float64(maxDelay)
-		}
-
-		// Добавляем джиттер: ±25% от вычисленной задержки
-		jitterFactor := 0.75 + rand.Float64()*0.5 // 0.75 до 1.25
-		delayWithJitter := exponentialDelay * jitterFactor
-
-		return time.Duration(delayWithJitter)
-	}
+type BackoffStrategy interface {
+	CalculateNextAttempt(attemptCount int) time.Time
 }
 
-// DefaultBackoffStrategy возвращает стандартную стратегию бэкоффа
+type LinearBackoffStrategy struct {
+	BaseDelay time.Duration
+}
+
+func (l *LinearBackoffStrategy) CalculateNextAttempt(attemptCount int) time.Time {
+	delay := l.BaseDelay * time.Duration(attemptCount)
+	return time.Now().Add(delay)
+}
+
+type ExponentialBackoffStrategy struct {
+	BaseDelay time.Duration
+	MaxDelay  time.Duration
+}
+
+func (e *ExponentialBackoffStrategy) CalculateNextAttempt(attemptCount int) time.Time {
+	delay := e.BaseDelay * time.Duration(math.Pow(2, float64(attemptCount-1)))
+	if delay > e.MaxDelay {
+		delay = e.MaxDelay
+	}
+	return time.Now().Add(delay)
+}
+
+type FixedBackoffStrategy struct {
+	Delay time.Duration
+}
+
+func (f *FixedBackoffStrategy) CalculateNextAttempt(attemptCount int) time.Time {
+	return time.Now().Add(f.Delay)
+}
+
 func DefaultBackoffStrategy() BackoffStrategy {
-	return ExponentialBackoffWithJitter(
-		100*time.Millisecond,  // базовая задержка
-		30*time.Second,        // максимальная задержка
-	)
+	return &ExponentialBackoffStrategy{
+		BaseDelay: defaultBaseDelay,
+		MaxDelay:  defaultMaxDelay,
+	}
 }
 
-// LinearBackoffWithJitter создает линейную стратегию бэкоффа с джиттером
-func LinearBackoffWithJitter(baseDelay time.Duration, maxDelay time.Duration) BackoffStrategy {
-	return func(attempt int) time.Duration {
-		if attempt <= 0 {
-			return baseDelay
-		}
+func NewLinearBackoffStrategy(baseDelay time.Duration) BackoffStrategy {
+	return &LinearBackoffStrategy{BaseDelay: baseDelay}
+}
 
-		// Линейная задержка: baseDelay * attempt
-		linearDelay := float64(baseDelay) * float64(attempt)
-		
-		// Ограничиваем максимальной задержкой
-		if linearDelay > float64(maxDelay) {
-			linearDelay = float64(maxDelay)
-		}
-
-		// Добавляем джиттер: ±20% от вычисленной задержки
-		jitterFactor := 0.8 + rand.Float64()*0.4 // 0.8 до 1.2
-		delayWithJitter := linearDelay * jitterFactor
-
-		return time.Duration(delayWithJitter)
+func NewExponentialBackoffStrategy(baseDelay, maxDelay time.Duration) BackoffStrategy {
+	return &ExponentialBackoffStrategy{
+		BaseDelay: baseDelay,
+		MaxDelay:  maxDelay,
 	}
+}
+
+func NewFixedBackoffStrategy(delay time.Duration) BackoffStrategy {
+	return &FixedBackoffStrategy{Delay: delay}
 }

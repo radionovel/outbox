@@ -3,178 +3,199 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"outbox"
-
 	_ "github.com/go-sql-driver/mysql"
+	"go.uber.org/zap"
+
+	"github.com/overtonx/outbox"
 )
 
 func main() {
-	// Конфигурация подключений
-	mysqlDSN := "root:password@tcp(localhost:3306)/outbox_db?parseTime=true&multiStatements=true"
-	kafkaBrokers := []string{"localhost:9092"}
-	kafkaTopic := "outbox_events"
-
-	// Подключение к MySQL
-	db, err := sql.Open("mysql", mysqlDSN)
+	// Создаем логгер
+	logger, err := zap.NewDevelopment()
 	if err != nil {
-		log.Fatalf("Failed to connect to MySQL: %v", err)
+		log.Fatal("Failed to create logger:", err)
+	}
+	defer logger.Sync()
+
+	// Подключаемся к базе данных
+	db, err := sql.Open("mysql", "outbox_user:outbox_pass@tcp(localhost:3306)/outbox_db?parseTime=true")
+	if err != nil {
+		logger.Fatal("Failed to connect to database", zap.Error(err))
 	}
 	defer db.Close()
 
 	// Проверяем соединение
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping MySQL: %v", err)
+		logger.Fatal("Failed to ping database", zap.Error(err))
 	}
 
-	// Создаем таблицу outbox
+	// Создаем таблицы outbox
 	ctx := context.Background()
 	if err := outbox.CreateOutboxTable(ctx, db); err != nil {
-		log.Fatalf("Failed to create outbox table: %v", err)
+		logger.Fatal("Failed to create outbox tables", zap.Error(err))
 	}
-	log.Println("Outbox table created successfully")
+	logger.Info("Outbox tables created successfully")
 
-	// Создаем Kafka продюсер
-	producer := outbox.NewKafkaProducer(kafkaBrokers, kafkaTopic)
-	defer producer.Close()
+	db.Exec("TRUNCATE outbox_events")
+	db.Exec("TRUNCATE outbox_deadletters")
 
-	// Проверяем доступность Kafka
-	if err := producer.HealthCheck(ctx); err != nil {
-		log.Printf("Warning: Kafka health check failed: %v", err)
-	} else {
-		log.Println("Kafka connection established")
-	}
-
-	// Создаем и настраиваем диспетчер
-	config := outbox.DispatcherConfig{
-		BatchSize:       50,
-		PollInterval:    2 * time.Second,
-		MaxAttempts:     3,
-		BackoffStrategy: outbox.DefaultBackoffStrategy(),
+	// Создаем конфигурацию Kafka
+	kafkaConfig := outbox.KafkaConfig{
+		Brokers:      []string{"localhost:9092"},
+		Topic:        "user-events",
+		BatchSize:    10,
+		BatchTimeout: 100 * time.Millisecond,
+		Async:        false,
 	}
 
-	dispatcher := outbox.NewDispatcher(config, db, producer)
+	// Создаем dispatcher с настройками
+	dispatcher := outbox.NewDispatcher(db,
+		outbox.WithLogger(logger),
+		outbox.WithKafkaConfig(kafkaConfig),
+		outbox.WithBatchSize(5),
+		outbox.WithPollInterval(1*time.Second),
+		outbox.WithMaxAttempts(3),
+	)
 
-	// Запускаем диспетчер
-	dispatcher.Start(ctx)
-	log.Println("Dispatcher started")
+	// Запускаем dispatcher в отдельной горутине
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Симуляция бизнес-логики: создание пользователя с событием
-	go simulateUserCreation(ctx, db)
+	go func() {
+		dispatcher.Start(ctx)
+	}()
 
-	// Ожидаем сигнала для graceful shutdown
+	// Ждем немного, чтобы dispatcher запустился
+	time.Sleep(2 * time.Second)
+
+	// Симулируем создание событий
+	logger.Info("Starting to create sample events...")
+	createSampleEvents(ctx, db, logger)
+
+	// Ждем сигнал завершения
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Периодически выводим статистику
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if stats, err := dispatcher.GetStats(ctx); err == nil {
-					log.Printf("Outbox stats: %+v", stats)
-				}
-			}
-		}
-	}()
-
-	<-sigChan
-	log.Println("Shutting down...")
-
-	// Останавливаем диспетчер
-	dispatcher.Stop()
-	log.Println("Dispatcher stopped")
-}
-
-// simulateUserCreation симулирует создание пользователя с сохранением события в outbox
-func simulateUserCreation(ctx context.Context, db *sql.DB) {
+	// Показываем метрики каждые 5 секунд
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	userID := 1
 	for {
 		select {
-		case <-ctx.Done():
+		case <-sigChan:
+			logger.Info("Received shutdown signal")
+			cancel()
+			dispatcher.Stop()
 			return
 		case <-ticker.C:
-			if err := createUserWithEvent(ctx, db, userID); err != nil {
-				log.Printf("Failed to create user with event: %v", err)
-			} else {
-				log.Printf("User %d created with outbox event", userID)
-				userID++
-			}
+			metrics := dispatcher.GetMetrics()
+			logger.Info("Dispatcher metrics", zap.Any("metrics", metrics))
 		}
 	}
 }
 
-// createUserWithEvent создает пользователя и сохраняет событие в outbox в одной транзакции
-func createUserWithEvent(ctx context.Context, db *sql.DB, userID int) error {
+func createSampleEvents(ctx context.Context, db *sql.DB, logger *zap.Logger) {
+	// Начинаем транзакцию
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		logger.Error("Failed to begin transaction", zap.Error(err))
+		return
 	}
 	defer tx.Rollback()
 
-	// Создаем пользователя (симуляция бизнес-логики)
-	userQuery := `INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)`
-	userName := fmt.Sprintf("User%d", userID)
-	userEmail := fmt.Sprintf("user%d@example.com", userID)
-	
-	_, err = tx.ExecContext(ctx, userQuery, userID, userName, userEmail, time.Now())
-	if err != nil {
-		return fmt.Errorf("failed to create user: %v", err)
-	}
-
-	// Создаем событие для outbox
-	event := outbox.OutboxEvent{
-		EventID:       fmt.Sprintf("user-created-%d-%d", userID, time.Now().Unix()),
-		AggregateType: "user",
-		AggregateID:   fmt.Sprintf("%d", userID),
-		EventType:     "user.created",
-		Payload: map[string]interface{}{
-			"user_id":   userID,
-			"name":      userName,
-			"email":     userEmail,
-			"timestamp": time.Now().Unix(),
+	// Создаем несколько событий
+	events := []struct {
+		eventID       string
+		eventType     string
+		aggregateType string
+		aggregateID   string
+		topic         string
+		payload       map[string]interface{}
+	}{
+		{
+			eventID:       "evt-001",
+			eventType:     "UserCreated",
+			aggregateType: "User",
+			aggregateID:   "user-123",
+			topic:         "user-events",
+			payload: map[string]interface{}{
+				"user_id":    "user-123",
+				"email":      "john@example.com",
+				"name":       "John Doe",
+				"created_at": time.Now().Format(time.RFC3339),
+			},
+		},
+		{
+			eventID:       "evt-002",
+			eventType:     "UserUpdated",
+			aggregateType: "User",
+			aggregateID:   "user-123",
+			topic:         "user-events",
+			payload: map[string]interface{}{
+				"user_id":    "user-123",
+				"email":      "john.doe@example.com",
+				"name":       "John Doe",
+				"updated_at": time.Now().Format(time.RFC3339),
+			},
+		},
+		{
+			eventID:       "evt-003",
+			eventType:     "OrderCreated",
+			aggregateType: "Order",
+			aggregateID:   "order-456",
+			topic:         "order-events",
+			payload: map[string]interface{}{
+				"order_id":   "order-456",
+				"user_id":    "user-123",
+				"amount":     99.99,
+				"currency":   "USD",
+				"created_at": time.Now().Format(time.RFC3339),
+			},
 		},
 	}
 
-	// Сохраняем событие в outbox
-	if err := outbox.SaveEvent(ctx, tx, event); err != nil {
-		return fmt.Errorf("failed to save outbox event: %v", err)
+	// Сохраняем события в outbox
+	for _, eventData := range events {
+		event, err := outbox.NewOutboxEvent(
+			eventData.eventID,
+			eventData.eventType,
+			eventData.aggregateType,
+			eventData.aggregateID,
+			eventData.topic,
+			eventData.payload,
+		)
+		if err != nil {
+			logger.Error("Failed to create outbox event",
+				zap.String("event_id", eventData.eventID),
+				zap.Error(err))
+			continue
+		}
+
+		// Сохраняем событие с автоматическим извлечением trace info
+		if err := outbox.SaveEventWithTrace(ctx, tx, event); err != nil {
+			logger.Error("Failed to save outbox event",
+				zap.String("event_id", eventData.eventID),
+				zap.Error(err))
+			continue
+		}
+
+		logger.Info("Event saved to outbox",
+			zap.String("event_id", eventData.eventID),
+			zap.String("event_type", eventData.eventType),
+			zap.String("topic", eventData.topic))
 	}
 
 	// Коммитим транзакцию
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
+		logger.Error("Failed to commit transaction", zap.Error(err))
+		return
 	}
 
-	return nil
-}
-
-// createUsersTable создает таблицу пользователей для демонстрации
-func createUsersTable(ctx context.Context, db *sql.DB) error {
-	query := `
-		CREATE TABLE IF NOT EXISTS users (
-			id INT PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			email VARCHAR(255) NOT NULL,
-			created_at DATETIME NOT NULL,
-			INDEX idx_email (email)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-	`
-
-	_, err := db.ExecContext(ctx, query)
-	return err
+	logger.Info("All events saved to outbox successfully")
 }

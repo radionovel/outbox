@@ -3,306 +3,248 @@ package outbox
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
-// DispatcherConfig содержит конфигурацию диспетчера
-type DispatcherConfig struct {
-	BatchSize       int           `json:"batch_size"`
-	PollInterval    time.Duration `json:"poll_interval"`
-	MaxAttempts     int           `json:"max_attempts"`
-	BackoffStrategy BackoffStrategy `json:"-"`
-}
+const (
+	EventRecordStatusNew        = 0
+	EventRecordStatusSent       = 1
+	EventRecordStatusRetry      = 2
+	EventRecordStatusError      = 3
+	EventRecordStatusProcessing = 4
+)
 
-// DefaultDispatcherConfig возвращает стандартную конфигурацию диспетчера
-func DefaultDispatcherConfig() DispatcherConfig {
-	return DispatcherConfig{
-		BatchSize:       100,
-		PollInterval:    1 * time.Second,
-		MaxAttempts:     5,
-		BackoffStrategy: DefaultBackoffStrategy(),
-	}
-}
+const (
+	defaultBatchSize               = 100
+	defaultPollInterval            = 2 * time.Second
+	defaultMaxAttempts             = 3
+	defaultBaseDelay               = 1 * time.Minute
+	defaultMaxDelay                = 30 * time.Minute
+	defaultDeadLetterInterval      = 5 * time.Minute
+	defaultStuckEventTimeout       = 10 * time.Minute
+	defaultStuckEventCheckInterval = 2 * time.Minute
+	defaultDeadLetterRetention     = 7 * 24 * time.Hour
+	defaultSentEventsRetention     = 24 * time.Hour
+	defaultCleanupInterval         = 1 * time.Hour
+)
 
-// Dispatcher представляет воркер для обработки событий из outbox
 type Dispatcher struct {
-	config     DispatcherConfig
-	db         *sql.DB
-	producer   *KafkaProducer
-	stopChan   chan struct{}
-	wg         sync.WaitGroup
-	mu         sync.RWMutex
-	isRunning  bool
-	logger     *log.Logger
+	eventProcessor    EventProcessor
+	deadLetterService DeadLetterService
+	stuckEventService StuckEventService
+	cleanupService    CleanupService
+	publisher         Publisher
+	metrics           MetricsCollector
+	logger            *zap.Logger
+
+	workers                 []Worker
+	batchSize               int
+	pollInterval            time.Duration
+	maxAttempts             int
+	deadLetterInterval      time.Duration
+	stuckEventTimeout       time.Duration
+	stuckEventCheckInterval time.Duration
+	deadLetterRetention     time.Duration
+	sentEventsRetention     time.Duration
+	cleanupInterval         time.Duration
+
+	mu       sync.RWMutex
+	started  bool
+	stopChan chan struct{}
 }
 
-// NewDispatcher создает новый диспетчер
-func NewDispatcher(config DispatcherConfig, db *sql.DB, producer *KafkaProducer) *Dispatcher {
-	if config.BackoffStrategy == nil {
-		config.BackoffStrategy = DefaultBackoffStrategy()
+type EventRecord struct {
+	ID            int64
+	AggregateType string
+	AggregateID   string
+	EventID       string
+	EventType     string
+	Payload       []byte
+	Topic         string
+	TraceID       string
+	SpanID        string
+	AttemptCount  int
+	NextAttemptAt *time.Time
+}
+
+type DeadLetterRecord struct {
+	ID            int64
+	EventID       string
+	EventType     string
+	AggregateType string
+	AggregateID   string
+	Topic         string
+	Payload       []byte
+	TraceID       *string
+	SpanID        *string
+	AttemptCount  int
+	LastError     string
+	CreatedAt     time.Time
+}
+
+func NewDispatcher(db *sql.DB, opts ...DispatcherOption) *Dispatcher {
+	options := &dispatcherOptions{
+		batchSize:               defaultBatchSize,
+		pollInterval:            defaultPollInterval,
+		maxAttempts:             defaultMaxAttempts,
+		deadLetterInterval:      defaultDeadLetterInterval,
+		stuckEventTimeout:       defaultStuckEventTimeout,
+		stuckEventCheckInterval: defaultStuckEventCheckInterval,
+		deadLetterRetention:     defaultDeadLetterRetention,
+		sentEventsRetention:     defaultSentEventsRetention,
+		cleanupInterval:         defaultCleanupInterval,
+		backoffStrategy:         DefaultBackoffStrategy(),
+		publisher:               NewKafkaPublisher(zap.NewNop()),
+		metrics:                 NewOpenTelemetryMetricsCollector(),
+		logger:                  zap.NewNop(),
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	eventProcessor := NewEventProcessor(
+		db,
+		options.logger,
+		options.backoffStrategy,
+		options.maxAttempts,
+		options.batchSize,
+		options.publisher,
+		options.metrics,
+	)
+
+	deadLetterService := NewDeadLetterService(
+		db,
+		options.logger,
+		options.batchSize,
+		options.metrics,
+	)
+
+	stuckEventService := NewStuckEventService(
+		db,
+		options.logger,
+		options.backoffStrategy,
+		options.maxAttempts,
+		options.batchSize,
+		options.stuckEventTimeout,
+		options.metrics,
+	)
+
+	cleanupService := NewCleanupService(
+		db,
+		options.logger,
+		options.batchSize,
+		options.deadLetterRetention,
+		options.sentEventsRetention,
+		options.metrics,
+	)
+
+	workers := []Worker{
+		NewBaseWorker("event_processor", options.pollInterval, options.logger, eventProcessor.ProcessEvents),
+		NewBaseWorker("deadletter_processor", options.deadLetterInterval, options.logger, deadLetterService.MoveToDeadLetters),
+		NewBaseWorker("stuck_events_processor", options.stuckEventCheckInterval, options.logger, stuckEventService.RecoverStuckEvents),
+		NewBaseWorker("cleanup_processor", options.cleanupInterval, options.logger, cleanupService.Cleanup),
 	}
 
 	return &Dispatcher{
-		config:   config,
-		db:       db,
-		producer: producer,
-		stopChan: make(chan struct{}),
-		logger:   log.Default(),
+		eventProcessor:          eventProcessor,
+		deadLetterService:       deadLetterService,
+		stuckEventService:       stuckEventService,
+		cleanupService:          cleanupService,
+		publisher:               options.publisher,
+		metrics:                 options.metrics,
+		logger:                  options.logger,
+		workers:                 workers,
+		batchSize:               options.batchSize,
+		pollInterval:            options.pollInterval,
+		maxAttempts:             options.maxAttempts,
+		deadLetterInterval:      options.deadLetterInterval,
+		stuckEventTimeout:       options.stuckEventTimeout,
+		stuckEventCheckInterval: options.stuckEventCheckInterval,
+		deadLetterRetention:     options.deadLetterRetention,
+		sentEventsRetention:     options.sentEventsRetention,
+		cleanupInterval:         options.cleanupInterval,
+		stopChan:                make(chan struct{}),
 	}
 }
 
-// Start запускает диспетчер в отдельной горутине
 func (d *Dispatcher) Start(ctx context.Context) {
 	d.mu.Lock()
-	if d.isRunning {
+	if d.started {
 		d.mu.Unlock()
+		d.logger.Warn("Dispatcher already started")
 		return
 	}
-	d.isRunning = true
+	d.started = true
 	d.mu.Unlock()
 
-	d.wg.Add(1)
-	go d.run(ctx)
-}
+	d.logger.Info("Starting outbox dispatcher",
+		zap.Int("batch_size", d.batchSize),
+		zap.Duration("poll_interval", d.pollInterval),
+		zap.Int("max_attempts", d.maxAttempts),
+		zap.Duration("deadletter_interval", d.deadLetterInterval),
+		zap.Duration("stuck_event_timeout", d.stuckEventTimeout),
+		zap.Duration("stuck_event_check_interval", d.stuckEventCheckInterval),
+		zap.Duration("deadletter_retention", d.deadLetterRetention),
+		zap.Duration("sent_events_retention", d.sentEventsRetention),
+		zap.Duration("cleanup_interval", d.cleanupInterval),
+	)
 
-// Stop останавливает диспетчер
-func (d *Dispatcher) Stop() {
+	for _, worker := range d.workers {
+		go worker.Start(ctx)
+	}
+
+	select {
+	case <-ctx.Done():
+		d.logger.Info("Context cancelled, stopping dispatcher")
+	case <-d.stopChan:
+		d.logger.Info("Stop signal received, stopping dispatcher")
+	}
+
+	for _, worker := range d.workers {
+		worker.Stop()
+	}
+
 	d.mu.Lock()
-	if !d.isRunning {
-		d.mu.Unlock()
-		return
-	}
-	d.isRunning = false
+	d.started = false
 	d.mu.Unlock()
-
-	close(d.stopChan)
-	d.wg.Wait()
 }
 
-// IsRunning возвращает true, если диспетчер запущен
-func (d *Dispatcher) IsRunning() bool {
+func (d *Dispatcher) Stop() {
+	d.mu.RLock()
+	if !d.started {
+		d.mu.RUnlock()
+		return
+	}
+	d.mu.RUnlock()
+
+	d.logger.Info("Stopping outbox dispatcher...")
+	close(d.stopChan)
+}
+
+func (d *Dispatcher) IsStarted() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.isRunning
+	return d.started
 }
 
-// run основная логика диспетчера
-func (d *Dispatcher) run(ctx context.Context) {
-	defer d.wg.Done()
-
-	ticker := time.NewTicker(d.config.PollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			d.logger.Println("Dispatcher context cancelled")
-			return
-		case <-d.stopChan:
-			d.logger.Println("Dispatcher stopped")
-			return
-		case <-ticker.C:
-			if err := d.processBatch(ctx); err != nil {
-				d.logger.Printf("Error processing batch: %v", err)
-			}
-		}
+func (d *Dispatcher) GetMetrics() map[string]interface{} {
+	return map[string]interface{}{
+		"started": d.IsStarted(),
+		"workers": len(d.workers),
+		"config": map[string]interface{}{
+			"batch_size":                 d.batchSize,
+			"poll_interval":              d.pollInterval,
+			"max_attempts":               d.maxAttempts,
+			"deadletter_interval":        d.deadLetterInterval,
+			"stuck_event_timeout":        d.stuckEventTimeout,
+			"stuck_event_check_interval": d.stuckEventCheckInterval,
+			"deadletter_retention":       d.deadLetterRetention,
+			"sent_events_retention":      d.sentEventsRetention,
+			"cleanup_interval":           d.cleanupInterval,
+		},
 	}
-}
-
-// processBatch обрабатывает пакет событий
-func (d *Dispatcher) processBatch(ctx context.Context) error {
-	events, err := d.fetchPendingEvents(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to fetch pending events: %w", err)
-	}
-
-	if len(events) == 0 {
-		return nil
-	}
-
-	d.logger.Printf("Processing %d events", len(events))
-
-	for _, event := range events {
-		if err := d.processEvent(ctx, event); err != nil {
-			d.logger.Printf("Failed to process event %s: %v", event.EventID, err)
-		}
-	}
-
-	return nil
-}
-
-// fetchPendingEvents получает события для обработки с блокировкой FOR UPDATE SKIP LOCKED
-func (d *Dispatcher) fetchPendingEvents(ctx context.Context) ([]OutboxRecord, error) {
-	query := `
-		SELECT id, event_id, aggregate_type, aggregate_id, event_type, 
-		       payload, status, attempts, next_attempt_at, created_at, last_error
-		FROM outbox 
-		WHERE (status = 'pending' OR (status = 'failed' AND next_attempt_at <= NOW()))
-		ORDER BY created_at ASC
-		LIMIT ?
-		FOR UPDATE SKIP LOCKED
-	`
-
-	rows, err := d.db.QueryContext(ctx, query, d.config.BatchSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query pending events: %w", err)
-	}
-	defer rows.Close()
-
-	var events []OutboxRecord
-	for rows.Next() {
-		var event OutboxRecord
-		var nextAttemptAt sql.NullTime
-		var lastError sql.NullString
-
-		err := rows.Scan(
-			&event.ID,
-			&event.EventID,
-			&event.AggregateType,
-			&event.AggregateID,
-			&event.EventType,
-			&event.Payload,
-			&event.Status,
-			&event.Attempts,
-			&nextAttemptAt,
-			&event.CreatedAt,
-			&lastError,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan event: %w", err)
-		}
-
-		if nextAttemptAt.Valid {
-			event.NextAttemptAt = &nextAttemptAt.Time
-		}
-		if lastError.Valid {
-			event.LastError = &lastError.String
-		}
-
-		events = append(events, event)
-	}
-
-	return events, nil
-}
-
-// processEvent обрабатывает одно событие
-func (d *Dispatcher) processEvent(ctx context.Context, event OutboxRecord) error {
-	// Обновляем статус на "sending"
-	if err := d.updateEventStatus(ctx, event.ID, StatusSending, event.Attempts, nil, nil); err != nil {
-		return fmt.Errorf("failed to update status to sending: %w", err)
-	}
-
-	// Десериализуем payload
-	var payload map[string]interface{}
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return fmt.Errorf("failed to unmarshal payload: %w", err)
-	}
-
-	// Создаем OutboxEvent для отправки
-	outboxEvent := OutboxEvent{
-		EventID:       event.EventID,
-		AggregateType: event.AggregateType,
-		AggregateID:   event.AggregateID,
-		EventType:     event.EventType,
-		Payload:       payload,
-	}
-
-	// Отправляем в Kafka
-	if err := d.producer.PublishEvent(ctx, outboxEvent); err != nil {
-		// Обрабатываем ошибку
-		return d.handlePublishError(ctx, event, err)
-	}
-
-	// Успешная отправка
-	return d.updateEventStatus(ctx, event.ID, StatusSent, event.Attempts, nil, nil)
-}
-
-// handlePublishError обрабатывает ошибку публикации
-func (d *Dispatcher) handlePublishError(ctx context.Context, event OutboxRecord, publishErr error) error {
-	newAttempts := event.Attempts + 1
-	errorMsg := publishErr.Error()
-
-	if newAttempts >= d.config.MaxAttempts {
-		// Достигнут лимит попыток
-		return d.updateEventStatus(ctx, event.ID, StatusFailed, newAttempts, nil, &errorMsg)
-	}
-
-	// Вычисляем время следующей попытки
-	nextAttemptAt := time.Now().Add(d.config.BackoffStrategy(newAttempts))
-	
-	return d.updateEventStatus(ctx, event.ID, StatusFailed, newAttempts, &nextAttemptAt, &errorMsg)
-}
-
-// updateEventStatus обновляет статус события в базе
-func (d *Dispatcher) updateEventStatus(ctx context.Context, id int64, status EventStatus, attempts int, nextAttemptAt *time.Time, lastError *string) error {
-	var query string
-	var args []interface{}
-
-	if nextAttemptAt != nil && lastError != nil {
-		query = `
-			UPDATE outbox 
-			SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
-			WHERE id = ?
-		`
-		args = []interface{}{status, attempts, nextAttemptAt, lastError, id}
-	} else if nextAttemptAt != nil {
-		query = `
-			UPDATE outbox 
-			SET status = ?, attempts = ?, next_attempt_at = ?
-			WHERE id = ?
-		`
-		args = []interface{}{status, attempts, nextAttemptAt, id}
-	} else if lastError != nil {
-		query = `
-			UPDATE outbox 
-			SET status = ?, attempts = ?, last_error = ?
-			WHERE id = ?
-		`
-		args = []interface{}{status, attempts, lastError, id}
-	} else {
-		query = `
-			UPDATE outbox 
-			SET status = ?, attempts = ?
-			WHERE id = ?
-		`
-		args = []interface{}{status, attempts, id}
-	}
-
-	_, err := d.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to update event status: %w", err)
-	}
-
-	return nil
-}
-
-// GetStats возвращает статистику диспетчера
-func (d *Dispatcher) GetStats(ctx context.Context) (map[string]int, error) {
-	query := `
-		SELECT status, COUNT(*) as count
-		FROM outbox
-		GROUP BY status
-	`
-
-	rows, err := d.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query stats: %w", err)
-	}
-	defer rows.Close()
-
-	stats := make(map[string]int)
-	for rows.Next() {
-		var status string
-		var count int
-		if err := rows.Scan(&status, &count); err != nil {
-			return nil, fmt.Errorf("failed to scan stats: %w", err)
-		}
-		stats[status] = count
-	}
-
-	return stats, nil
 }
