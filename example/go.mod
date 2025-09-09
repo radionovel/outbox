@@ -4,8 +4,8 @@ go 1.23.0
 
 require (
 	github.com/go-sql-driver/mysql v1.7.1
+	github.com/overtonx/outbox v1.0.0
 	go.uber.org/zap v1.24.0
-	outbox v0.0.0
 )
 
 require (
@@ -22,5 +22,3 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
-
-replace outbox => ../
