@@ -163,10 +163,6 @@ func (p *EventProcessorImpl) handlePublishError(ctx context.Context, event Event
 		zap.Int("max_attempts", p.maxAttempts),
 	}
 
-	// Создаем контекст с таймаутом для обновления БД
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
 	var dbErr error
 	var newStatus int
 	var nextAttemptAt *time.Time
@@ -195,7 +191,7 @@ func (p *EventProcessorImpl) handlePublishError(ctx context.Context, event Event
 		})
 	}
 
-	dbErr = p.updateStatus(dbCtx, event.ID, newStatus, attempt, nextAttemptAt, publishErr)
+	dbErr = p.updateStatus(ctx, event.ID, newStatus, attempt, nextAttemptAt, publishErr)
 	if dbErr != nil {
 		p.logger.Error("Failed to update event status in database",
 			append(eventFields,
@@ -221,11 +217,7 @@ func (p *EventProcessorImpl) handlePublishSuccess(ctx context.Context, event Eve
 		zap.Int("attempt", attempt),
 	}
 
-	// Создаем контекст с таймаутом для обновления БД
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	if err := p.updateStatus(dbCtx, event.ID, EventRecordStatusSent, attempt, nil, nil); err != nil {
+	if err := p.updateStatus(ctx, event.ID, EventRecordStatusSent, attempt, nil, nil); err != nil {
 		p.logger.Error("Failed to update event status to sent in database",
 			append(eventFields, zap.Error(err))...,
 		)
@@ -353,13 +345,6 @@ func (p *EventProcessorImpl) updateStatus(ctx context.Context, eventID int64, st
 	}
 	if attemptCount < 0 {
 		return fmt.Errorf("invalid attempt count: %d", attemptCount)
-	}
-
-	// Проверяем контекст на отмену
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("context cancelled while updating status: %w", ctx.Err())
-	default:
 	}
 
 	updateFields := []zap.Field{
