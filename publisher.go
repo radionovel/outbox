@@ -2,12 +2,15 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
+
+const defaultKafkaRetryTimeout = time.Millisecond * 250
 
 type NopPublisher struct {
 	logger *zap.Logger
@@ -114,8 +117,17 @@ func (p *KafkaPublisher) Publish(ctx context.Context, event EventRecord) error {
 		Headers: p.buildKafkaHeaders(event),
 		Time:    time.Now(),
 	}
+	var err error
+	for {
+		err = p.writer.WriteMessages(ctx, message)
+		if errors.Is(err, kafka.LeaderNotAvailable) || errors.Is(err, context.DeadlineExceeded) {
+			time.Sleep(defaultKafkaRetryTimeout)
+			continue
+		}
 
-	err := p.writer.WriteMessages(ctx, message)
+		break
+	}
+
 	if err != nil {
 		p.logger.Error("Failed to publish event to Kafka",
 			zap.String("event_id", event.EventID),
