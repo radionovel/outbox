@@ -116,7 +116,12 @@ func createSampleEvents(ctx context.Context, db *sql.DB, logger *zap.Logger) {
 		aggregateType string
 		aggregateID   string
 		topic         string
-		payload       map[string]interface{}
+		payload       struct {
+			UserID    string    `json:"user_id"`
+			Email     string    `json:"email"`
+			Name      string    `json:"name"`
+			CreatedAt time.Time `json:"created_at"`
+		}
 	}{
 		{
 			eventID:       "evt-001",
@@ -124,11 +129,16 @@ func createSampleEvents(ctx context.Context, db *sql.DB, logger *zap.Logger) {
 			aggregateType: "User",
 			aggregateID:   "user-123",
 			topic:         "user-events",
-			payload: map[string]interface{}{
-				"user_id":    "user-123",
-				"email":      "john@example.com",
-				"name":       "John Doe",
-				"created_at": time.Now().Format(time.RFC3339),
+			payload: struct {
+				UserID    string    `json:"user_id"`
+				Email     string    `json:"email"`
+				Name      string    `json:"name"`
+				CreatedAt time.Time `json:"created_at"`
+			}{
+				UserID:    "user-123",
+				Email:     "john@example.com",
+				Name:      "John Doe",
+				CreatedAt: time.Now(),
 			},
 		},
 		{
@@ -137,25 +147,16 @@ func createSampleEvents(ctx context.Context, db *sql.DB, logger *zap.Logger) {
 			aggregateType: "User",
 			aggregateID:   "user-123",
 			topic:         "user-events",
-			payload: map[string]interface{}{
-				"user_id":    "user-123",
-				"email":      "john.doe@example.com",
-				"name":       "John Doe",
-				"updated_at": time.Now().Format(time.RFC3339),
-			},
-		},
-		{
-			eventID:       "evt-003",
-			eventType:     "OrderCreated",
-			aggregateType: "Order",
-			aggregateID:   "order-456",
-			topic:         "order-events",
-			payload: map[string]interface{}{
-				"order_id":   "order-456",
-				"user_id":    "user-123",
-				"amount":     99.99,
-				"currency":   "USD",
-				"created_at": time.Now().Format(time.RFC3339),
+			payload: struct {
+				UserID    string    `json:"user_id"`
+				Email     string    `json:"email"`
+				Name      string    `json:"name"`
+				CreatedAt time.Time `json:"created_at"`
+			}{
+				UserID:    "user-123",
+				Email:     "john.doe@example.com",
+				Name:      "John Doe",
+				CreatedAt: time.Now(),
 			},
 		},
 	}

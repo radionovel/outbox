@@ -16,17 +16,17 @@ var (
 )
 
 type Event struct {
-	EventID       string                 `json:"event_id"`
-	EventType     string                 `json:"event_type"`
-	AggregateType string                 `json:"aggregate_type"`
-	AggregateID   string                 `json:"aggregate_id"`
-	Topic         string                 `json:"topic"`
-	Payload       map[string]interface{} `json:"payload"`
-	TraceID       string                 `json:"trace_id,omitempty"`
-	SpanID        string                 `json:"span_id,omitempty"`
+	EventID       string      `json:"event_id"`
+	EventType     string      `json:"event_type"`
+	AggregateType string      `json:"aggregate_type"`
+	AggregateID   string      `json:"aggregate_id"`
+	Topic         string      `json:"topic"`
+	Payload       interface{} `json:"payload"`
+	TraceID       string      `json:"trace_id,omitempty"`
+	SpanID        string      `json:"span_id,omitempty"`
 }
 
-func NewOutboxEvent(eventID, eventType, aggregateType, aggregateID, topic string, payload map[string]interface{}) (Event, error) {
+func NewOutboxEvent(eventID, eventType, aggregateType, aggregateID, topic string, payload interface{}) (Event, error) {
 	event := Event{
 		EventID:       eventID,
 		EventType:     eventType,
