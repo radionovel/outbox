@@ -11,6 +11,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+var (
+	ErrEventAlreadyExists = errors.New("event already exists")
+)
+
 type Event struct {
 	EventID       string                 `json:"event_id"`
 	EventType     string                 `json:"event_type"`
@@ -78,19 +82,22 @@ func SaveEvent(ctx context.Context, tx *sql.Tx, event Event) error {
 	)
 
 	if err != nil {
-		var msqlError *mysql.MySQLError
-		if ok := errors.As(err, &msqlError); ok {
-			switch msqlError.Number {
-			case 1062:
-				return fmt.Errorf("failed to save outbox event: %w", ErrDuplicatedKey)
-			default:
-				return fmt.Errorf("failed to save outbox event: %w", err)
-			}
-		}
-		return fmt.Errorf("failed to save outbox event: %w", err)
+		return fmt.Errorf("failed to save outbox event: %w", convertFromDBError(err))
 	}
 
 	return nil
+}
+
+func convertFromDBError(err error) error {
+	var msqlError *mysql.MySQLError
+	if ok := errors.As(err, &msqlError); ok {
+		switch msqlError.Number {
+		case 1062: // err duplicate rows
+			return ErrEventAlreadyExists
+		}
+	}
+
+	return err
 }
 
 func SaveEventWithTrace(ctx context.Context, tx *sql.Tx, event Event) error {
