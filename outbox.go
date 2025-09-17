@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
+	"github.com/go-sql-driver/mysql"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -76,6 +78,15 @@ func SaveEvent(ctx context.Context, tx *sql.Tx, event Event) error {
 	)
 
 	if err != nil {
+		var msqlError *mysql.MySQLError
+		if ok := errors.As(err, &msqlError); ok {
+			switch msqlError.Number {
+			case 1062:
+				return fmt.Errorf("failed to save outbox event: %w", ErrDuplicatedKey)
+			default:
+				return fmt.Errorf("failed to save outbox event: %w", err)
+			}
+		}
 		return fmt.Errorf("failed to save outbox event: %w", err)
 	}
 
