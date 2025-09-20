@@ -2,15 +2,12 @@ package outbox
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"go.uber.org/zap"
 )
-
-const defaultKafkaRetryTimeout = time.Millisecond * 250
 
 type NopPublisher struct {
 	logger *zap.Logger
@@ -22,83 +19,75 @@ func NewDefaultPublisher(logger *zap.Logger) *NopPublisher {
 	}
 }
 
-func (p *NopPublisher) Publish(ctx context.Context, event EventRecord) error {
+func (p *NopPublisher) Publish(_ context.Context, _ EventRecord) error {
+	return nil
+}
+
+func (p *NopPublisher) Close() error {
 	return nil
 }
 
 type KafkaPublisher struct {
-	logger *zap.Logger
-	writer *kafka.Writer
-	config KafkaConfig
+	logger   *zap.Logger
+	producer *kafka.Producer
+	config   KafkaConfig
 }
 
+// KafkaHeaderBuilder defines a function type for building Kafka message headers from an EventRecord.
+type KafkaHeaderBuilder func(record EventRecord) []kafka.Header
+
 type KafkaConfig struct {
-	Brokers      []string
-	Topic        string
-	Balancer     kafka.Balancer
-	BatchSize    int
-	BatchBytes   int64
-	BatchTimeout time.Duration
-	Async        bool
-	RequiredAcks kafka.RequiredAcks
-	Compression  kafka.Compression
-	WriteTimeout time.Duration
-	ReadTimeout  time.Duration
-	MaxAttempts  int
-	ErrorLogger  kafka.Logger
-	Logger       kafka.Logger
+	Topic         string
+	ProducerProps kafka.ConfigMap
+	HeaderBuilder KafkaHeaderBuilder
 }
 
 func DefaultKafkaConfig() KafkaConfig {
 	return KafkaConfig{
-		Brokers:      []string{"localhost:9092"},
-		Topic:        "outbox-events",
-		Balancer:     &kafka.LeastBytes{},
-		BatchSize:    1,
-		BatchBytes:   1048576, // 1MB
-		BatchTimeout: 10 * time.Millisecond,
-		Async:        false,
-		RequiredAcks: kafka.RequireAll,
-		Compression:  kafka.Snappy,
-		WriteTimeout: 10 * time.Second,
-		ReadTimeout:  10 * time.Second,
-		MaxAttempts:  3,
-		ErrorLogger:  nil,
-		Logger:       nil,
+		Topic: "outbox-events",
+		ProducerProps: kafka.ConfigMap{
+			"bootstrap.servers":  "localhost:9092",
+			"acks":               "all",
+			"retries":            3,
+			"linger.ms":          10,
+			"enable.idempotence": true,
+			"compression.type":   "snappy",
+		},
+		HeaderBuilder: buildKafkaHeaders,
 	}
 }
 
-func NewKafkaPublisher(logger *zap.Logger) *KafkaPublisher {
+func NewKafkaPublisher(logger *zap.Logger) (*KafkaPublisher, error) {
 	config := DefaultKafkaConfig()
 	return NewKafkaPublisherWithConfig(logger, config)
 }
 
-func NewKafkaPublisherWithConfig(logger *zap.Logger, config KafkaConfig) *KafkaPublisher {
-	writer := &kafka.Writer{
-		Addr:                   kafka.TCP(config.Brokers...),
-		Balancer:               config.Balancer,
-		BatchSize:              config.BatchSize,
-		BatchBytes:             config.BatchBytes,
-		BatchTimeout:           config.BatchTimeout,
-		Async:                  config.Async,
-		RequiredAcks:           config.RequiredAcks,
-		Compression:            config.Compression,
-		WriteTimeout:           config.WriteTimeout,
-		ReadTimeout:            config.ReadTimeout,
-		MaxAttempts:            config.MaxAttempts,
-		ErrorLogger:            config.ErrorLogger,
-		AllowAutoTopicCreation: true,
-		Logger:                 config.Logger,
+func NewKafkaPublisherWithConfig(logger *zap.Logger, config KafkaConfig) (*KafkaPublisher, error) {
+	producer, err := kafka.NewProducer(&config.ProducerProps)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kafka producer: %w", err)
 	}
 
-	return &KafkaPublisher{
-		logger: logger,
-		writer: writer,
-		config: config,
+	if config.HeaderBuilder == nil {
+		config.HeaderBuilder = buildKafkaHeaders
 	}
+
+	return NewKafkaPublisherFromProducer(logger, producer, config), nil
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, event EventRecord) error {
+func NewKafkaPublisherFromProducer(logger *zap.Logger, producer *kafka.Producer, config KafkaConfig) *KafkaPublisher {
+	p := &KafkaPublisher{
+		logger:   logger,
+		producer: producer,
+		config:   config,
+	}
+
+	go p.handleDeliveryReports()
+
+	return p
+}
+
+func (p *KafkaPublisher) Publish(_ context.Context, event EventRecord) error {
 	topic := event.Topic
 	if topic == "" {
 		topic = p.config.Topic
@@ -110,48 +99,49 @@ func (p *KafkaPublisher) Publish(ctx context.Context, event EventRecord) error {
 		zap.String("topic", topic),
 	)
 
-	message := kafka.Message{
-		Topic:   topic,
-		Key:     []byte(event.AggregateID),
-		Value:   event.Payload,
-		Headers: p.buildKafkaHeaders(event),
-		Time:    time.Now(),
-	}
-	var err error
-	for {
-		err = p.writer.WriteMessages(ctx, message)
-		if errors.Is(err, kafka.LeaderNotAvailable) || errors.Is(err, context.DeadlineExceeded) {
-			time.Sleep(defaultKafkaRetryTimeout)
-			continue
-		}
-
-		break
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Key:            []byte(event.AggregateID),
+		Value:          event.Payload,
+		Headers:        p.config.HeaderBuilder(event),
+		Timestamp:      time.Now(),
 	}
 
-	if err != nil {
-		p.logger.Error("Failed to publish event to Kafka",
-			zap.String("event_id", event.EventID),
-			zap.Error(err),
-		)
-		return fmt.Errorf("failed to publish event to Kafka: %w", err)
-	}
-
-	p.logger.Info("Successfully published event to Kafka",
-		zap.String("event_id", event.EventID),
-		zap.String("topic", topic),
-	)
-
-	return nil
+	return p.producer.Produce(message, nil)
 }
 
 func (p *KafkaPublisher) Close() error {
-	if p.writer != nil {
-		return p.writer.Close()
-	}
+	p.logger.Info("Closing kafka producer")
+	p.producer.Flush(15 * 1000) // 15 sec
+	p.producer.Close()
 	return nil
 }
 
-func (p *KafkaPublisher) buildKafkaHeaders(event EventRecord) []kafka.Header {
+func (p *KafkaPublisher) handleDeliveryReports() {
+	for e := range p.producer.Events() {
+		switch ev := e.(type) {
+		case *kafka.Message:
+			if ev.TopicPartition.Error != nil {
+				p.logger.Error("Delivery failed",
+					zap.String("topic", *ev.TopicPartition.Topic),
+					zap.Error(ev.TopicPartition.Error),
+				)
+			} else {
+				p.logger.Debug("Successfully delivered message",
+					zap.String("topic", *ev.TopicPartition.Topic),
+					zap.Int32("partition", ev.TopicPartition.Partition),
+					zap.Any("offset", ev.TopicPartition.Offset),
+				)
+			}
+		case kafka.Error:
+			p.logger.Error("Kafka error", zap.Error(ev))
+		default:
+			p.logger.Debug("Ignored kafka event", zap.Any("event", ev))
+		}
+	}
+}
+
+func buildKafkaHeaders(event EventRecord) []kafka.Header {
 	headers := []kafka.Header{
 		{Key: "event_id", Value: []byte(event.EventID)},
 		{Key: "event_type", Value: []byte(event.EventType)},

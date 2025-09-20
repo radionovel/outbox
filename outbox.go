@@ -134,7 +134,7 @@ func SaveEventRecord(ctx context.Context, tx *sql.Tx, event EventRecord) error {
 	return nil
 }
 
-func CreateOutboxTable(ctx context.Context, db *sql.DB) error {
+func ensureOutboxTable(ctx context.Context, db *sql.DB) error {
 	err := createOutboxEventsTable(ctx, db)
 	if err != nil {
 		return err
@@ -151,21 +151,21 @@ func CreateOutboxTable(ctx context.Context, db *sql.DB) error {
 func createOutboxEventsTable(ctx context.Context, db *sql.DB) error {
 	query := `
 		CREATE TABLE IF NOT EXISTS outbox_events (
-			id              bigint auto_increment primary key,
-			event_id        char(36)     not null unique,
-			event_type      varchar(255) not null,
-			aggregate_type  varchar(255) not null,
-			aggregate_id    varchar(255) not null,
-			status          int          not null default 0 comment '0 - new, 1 - success, 2 - retry, 3 - error, 4 - processing',
-			topic           varchar(255) not null,
-			payload         json         not null,
-			trace_id        char(36)     null,
-			span_id         char(36)     null,
-			attempt_count   int          not null default 0,
-			next_attempt_at timestamp    null,
-			last_error      text         null,
-			created_at      timestamp(6) not null default current_timestamp(6),
-			updated_at      timestamp(6) not null default current_timestamp(6) on update current_timestamp(6),
+			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+			event_id        CHAR(36)     NOT NULL UNIQUE,
+			event_type      VARCHAR(255) NOT NULL,
+			aggregate_type  VARCHAR(255) NOT NULL,
+			aggregate_id    VARCHAR(255) NOT NULL,
+			status          INT          NOT NULL DEFAULT 0 COMMENT '0 - new, 1 - success, 2 - retry, 3 - error, 4 - processing',
+			topic           VARCHAR(255) NOT NULL,
+			payload         JSON         NOT NULL,
+			trace_id        CHAR(36)     NULL,
+			span_id         CHAR(36)     NULL,
+			attempt_count   INT          NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMP    NULL,
+			last_error      TEXT         NULL,
+			created_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			updated_at      TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
 			INDEX idx_status_next_attempt (status, next_attempt_at),
 			INDEX idx_aggregate (aggregate_type, aggregate_id),
 			INDEX idx_created_at (created_at)
@@ -184,18 +184,18 @@ func createOutboxDeadlettersTable(ctx context.Context, db *sql.DB) error {
 	query := `
 		CREATE TABLE IF NOT EXISTS outbox_deadletters
 		(
-		    id              bigint primary key,
-		    event_id        char(36)      not null unique,
-		    event_type      varchar(255)  not null,
-		    aggregate_type  varchar(255)  not null,
-		    aggregate_id    varchar(255)  not null,
-		    topic           varchar(255)  not null,
-		    payload         json          not null,
-		    trace_id        char(36)      null,
-		    span_id         char(36)      null,
-		    attempt_count   int           not null,
-		    last_error      varchar(2000) null,
-		    created_at      timestamp(6)  not null default current_timestamp(6)
+		    id              BIGINT PRIMARY KEY,
+		    event_id        CHAR(36)      NOT NULL UNIQUE,
+		    event_type      VARCHAR(255)  NOT NULL,
+		    aggregate_type  VARCHAR(255)  NOT NULL,
+		    aggregate_id    VARCHAR(255)  NOT NULL,
+		    topic           VARCHAR(255)  NOT NULL,
+		    payload         JSON          NOT NULL,
+		    trace_id        CHAR(36)      NULL,
+		    span_id         CHAR(36)      NULL,
+		    attempt_count   INT           NOT NULL,
+		    last_error      VARCHAR(2000) NULL,
+		    created_at      TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 	`
 

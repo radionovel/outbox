@@ -87,7 +87,6 @@ func (p *EventProcessorImpl) processEvent(ctx context.Context, event EventRecord
 		return fmt.Errorf("invalid event: %w", err)
 	}
 
-	// Проверяем контекст на отмену
 	select {
 	case <-ctx.Done():
 		return fmt.Errorf("context cancelled: %w", ctx.Err())

@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"time"
-
-	"github.com/overtonx/outbox"
 )
 
 // Config содержит конфигурацию для примера outbox
@@ -67,17 +65,6 @@ func DefaultConfig() Config {
 			SentEventsRetention:     24 * time.Hour,
 			CleanupInterval:         1 * time.Hour,
 		},
-	}
-}
-
-// ToOutboxKafkaConfig преобразует KafkaConfig в outbox.KafkaConfig
-func (k KafkaConfig) ToOutboxKafkaConfig() outbox.KafkaConfig {
-	return outbox.KafkaConfig{
-		Brokers:      k.Brokers,
-		Topic:        k.Topic,
-		BatchSize:    10,
-		BatchTimeout: 100 * time.Millisecond,
-		Async:        false,
 	}
 }
 
