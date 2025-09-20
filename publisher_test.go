@@ -99,7 +99,7 @@ func TestBuildKafkaHeaders(t *testing.T) {
 		SpanID:        "test-span-id",
 	}
 
-	headers := publisher.buildKafkaHeaders(event)
+	headers := buildKafkaHeaders(event)
 
 	expectedHeaders := map[string]string{
 		"event_id":       "test-event-id",
@@ -133,7 +133,7 @@ func TestBuildKafkaHeadersWithoutTraceInfo(t *testing.T) {
 		SpanID:        "",
 	}
 
-	headers := publisher.buildKafkaHeaders(event)
+	headers := buildKafkaHeaders(event)
 
 	expectedHeaders := map[string]string{
 		"event_id":       "test-event-id",

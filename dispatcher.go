@@ -115,6 +115,10 @@ func NewDispatcher(db *sql.DB, opts ...DispatcherOption) (*Dispatcher, error) {
 		}
 	}
 
+	if err := ensureOutboxTable(context.Background(), db); err != nil {
+		options.logger.Fatal("Failed to create outbox tables", zap.Error(err))
+	}
+
 	eventProcessor := NewEventProcessor(
 		db,
 		options.logger,

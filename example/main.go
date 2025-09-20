@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	_ "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 
@@ -35,33 +36,32 @@ func main() {
 		logger.Fatal("Failed to ping database", zap.Error(err))
 	}
 
-	// Создаем таблицы outbox
 	ctx := context.Background()
-	if err := outbox.CreateOutboxTable(ctx, db); err != nil {
-		logger.Fatal("Failed to create outbox tables", zap.Error(err))
-	}
-	logger.Info("Outbox tables created successfully")
-
-	db.Exec("TRUNCATE outbox_events")
-	db.Exec("TRUNCATE outbox_deadletters")
 
 	// Создаем конфигурацию Kafka
 	kafkaConfig := outbox.KafkaConfig{
-		Brokers:      []string{"localhost:9092"},
-		Topic:        "user-events",
-		BatchSize:    10,
-		BatchTimeout: 100 * time.Millisecond,
-		Async:        false,
+		Topic: "user-events",
+		ProducerProps: kafka.ConfigMap{
+			"bootstrap.servers":  "localhost:9092",
+			"acks":               "all",
+			"retries":            3,
+			"linger.ms":          10,
+			"enable.idempotence": true,
+			"compression.type":   "snappy",
+		},
 	}
 
 	// Создаем dispatcher с настройками
-	dispatcher := outbox.NewDispatcher(db,
+	dispatcher, _ := outbox.NewDispatcher(db,
 		outbox.WithLogger(logger),
 		outbox.WithKafkaConfig(kafkaConfig),
 		outbox.WithBatchSize(5),
 		outbox.WithPollInterval(1*time.Second),
 		outbox.WithMaxAttempts(3),
 	)
+
+	db.Exec("TRUNCATE outbox_events")
+	db.Exec("TRUNCATE outbox_deadletters")
 
 	// Запускаем dispatcher в отдельной горутине
 	ctx, cancel := context.WithCancel(context.Background())

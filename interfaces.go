@@ -7,6 +7,7 @@ import (
 
 type Publisher interface {
 	Publish(ctx context.Context, event EventRecord) error
+	Close() error
 }
 
 type EventProcessor interface {
