@@ -85,7 +85,7 @@ type DeadLetterRecord struct {
 	CreatedAt     time.Time
 }
 
-func NewDispatcher(db *sql.DB, opts ...DispatcherOption) *Dispatcher {
+func NewDispatcher(db *sql.DB, opts ...DispatcherOption) (*Dispatcher, error) {
 	options := &dispatcherOptions{
 		batchSize:               defaultBatchSize,
 		pollInterval:            defaultPollInterval,
@@ -97,13 +97,22 @@ func NewDispatcher(db *sql.DB, opts ...DispatcherOption) *Dispatcher {
 		sentEventsRetention:     defaultSentEventsRetention,
 		cleanupInterval:         defaultCleanupInterval,
 		backoffStrategy:         DefaultBackoffStrategy(),
-		publisher:               NewKafkaPublisher(zap.NewNop()),
 		metrics:                 NewOpenTelemetryMetricsCollector(),
 		logger:                  zap.NewNop(),
 	}
 
 	for _, opt := range opts {
-		opt(options)
+		if err := opt(options); err != nil {
+			return nil, err
+		}
+	}
+
+	if options.publisher == nil {
+		var err error
+		options.publisher, err = NewKafkaPublisher(options.logger)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	eventProcessor := NewEventProcessor(
@@ -168,7 +177,7 @@ func NewDispatcher(db *sql.DB, opts ...DispatcherOption) *Dispatcher {
 		sentEventsRetention:     options.sentEventsRetention,
 		cleanupInterval:         options.cleanupInterval,
 		stopChan:                make(chan struct{}),
-	}
+	}, nil
 }
 
 func (d *Dispatcher) Start(ctx context.Context) {

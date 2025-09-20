@@ -3,9 +3,9 @@ package outbox
 import (
 	"context"
 	"testing"
-	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
 
@@ -13,13 +13,8 @@ func TestNewDefaultPublisher(t *testing.T) {
 	logger := zap.NewNop()
 	publisher := NewDefaultPublisher(logger)
 
-	if publisher == nil {
-		t.Fatal("Expected non-nil publisher")
-	}
-
-	if publisher.logger != logger {
-		t.Error("Expected logger to match")
-	}
+	assert.NotNil(t, publisher, "Expected non-nil publisher")
+	assert.Equal(t, logger, publisher.logger, "Expected logger to match")
 }
 
 func TestDefaultPublisherPublish(t *testing.T) {
@@ -31,155 +26,69 @@ func TestDefaultPublisherPublish(t *testing.T) {
 	ctx := context.Background()
 	err := publisher.Publish(ctx, event)
 
-	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
-	}
+	assert.NoError(t, err, "Expected no error")
 }
 
 func TestDefaultKafkaConfig(t *testing.T) {
 	config := DefaultKafkaConfig()
 
-	if len(config.Brokers) != 1 || config.Brokers[0] != "localhost:9092" {
-		t.Errorf("Expected brokers [localhost:9092], got %v", config.Brokers)
-	}
-
-	if config.Topic != "outbox-events" {
-		t.Errorf("Expected topic 'outbox-events', got %s", config.Topic)
-	}
-
-	if config.BatchSize != 1 {
-		t.Errorf("Expected BatchSize 1, got %d", config.BatchSize)
-	}
-
-	if config.BatchBytes != 1048576 {
-		t.Errorf("Expected BatchBytes 1048576, got %d", config.BatchBytes)
-	}
-
-	if config.BatchTimeout != 10*time.Millisecond {
-		t.Errorf("Expected BatchTimeout 10ms, got %v", config.BatchTimeout)
-	}
-
-	if config.Async != false {
-		t.Error("Expected Async false")
-	}
-
-	if config.RequiredAcks != kafka.RequireAll {
-		t.Errorf("Expected RequiredAcks RequireAll, got %v", config.RequiredAcks)
-	}
-
-	if config.Compression != kafka.Snappy {
-		t.Errorf("Expected Compression Snappy, got %v", config.Compression)
-	}
-
-	if config.WriteTimeout != 10*time.Second {
-		t.Errorf("Expected WriteTimeout 10s, got %v", config.WriteTimeout)
-	}
-
-	if config.ReadTimeout != 10*time.Second {
-		t.Errorf("Expected ReadTimeout 10s, got %v", config.ReadTimeout)
-	}
-
-	if config.MaxAttempts != 3 {
-		t.Errorf("Expected MaxAttempts 3, got %d", config.MaxAttempts)
-	}
-
-	if config.ErrorLogger != nil {
-		t.Error("Expected ErrorLogger to be nil")
-	}
-
-	if config.Logger != nil {
-		t.Error("Expected Logger to be nil")
-	}
+	assert.Equal(t, "outbox-events", config.Topic, "Expected topic 'outbox-events'")
+	assert.Equal(t, "localhost:9092", config.ProducerProps["bootstrap.servers"], "Expected brokers 'localhost:9092'")
+	assert.Equal(t, "all", config.ProducerProps["acks"], "Expected acks 'all'")
 }
 
 func TestNewKafkaPublisher(t *testing.T) {
 	logger := zap.NewNop()
-	publisher := NewKafkaPublisher(logger)
+	publisher, err := NewKafkaPublisher(logger)
+	assert.NoError(t, err)
+	defer func() {
+		if publisher != nil {
+			publisher.Close()
+		}
+	}()
 
-	if publisher == nil {
-		t.Fatal("Expected non-nil publisher")
-	}
-
-	if publisher.logger != logger {
-		t.Error("Expected logger to match")
-	}
-
-	if publisher.writer == nil {
-		t.Fatal("Expected non-nil writer")
-	}
-
-	if publisher.config.Topic != "outbox-events" {
-		t.Errorf("Expected default topic 'outbox-events', got %s", publisher.config.Topic)
-	}
+	assert.NotNil(t, publisher, "Expected non-nil publisher")
+	assert.Equal(t, logger, publisher.logger, "Expected logger to match")
+	assert.NotNil(t, publisher.producer, "Expected non-nil producer")
+	assert.Equal(t, "outbox-events", publisher.config.Topic, "Expected default topic 'outbox-events'")
 }
 
 func TestNewKafkaPublisherWithConfig(t *testing.T) {
 	logger := zap.NewNop()
 	config := KafkaConfig{
-		Brokers:      []string{"localhost:9092", "localhost:9093"},
-		Topic:        "custom-topic",
-		BatchSize:    10,
-		BatchBytes:   2048576,
-		BatchTimeout: 20 * time.Millisecond,
-		Async:        true,
-		RequiredAcks: kafka.RequireOne,
-		Compression:  kafka.Gzip,
-		WriteTimeout: 20 * time.Second,
-		ReadTimeout:  20 * time.Second,
-		MaxAttempts:  5,
+		Topic: "custom-topic",
+		ProducerProps: kafka.ConfigMap{
+			"bootstrap.servers": "localhost:9092",
+			"acks":              "1",
+		},
 	}
 
-	publisher := NewKafkaPublisherWithConfig(logger, config)
+	publisher, err := NewKafkaPublisherWithConfig(logger, config)
+	assert.NoError(t, err)
+	defer func() {
+		if publisher != nil {
+			publisher.Close()
+		}
+	}()
 
-	if publisher == nil {
-		t.Fatal("Expected non-nil publisher")
-	}
-
-	if publisher.logger != logger {
-		t.Error("Expected logger to match")
-	}
-
-	if publisher.writer == nil {
-		t.Fatal("Expected non-nil writer")
-	}
-
-	if publisher.config.Topic != config.Topic {
-		t.Errorf("Expected topic %s, got %s", config.Topic, publisher.config.Topic)
-	}
-
-	if publisher.config.BatchSize != config.BatchSize {
-		t.Errorf("Expected BatchSize %d, got %d", config.BatchSize, publisher.config.BatchSize)
-	}
+	assert.NotNil(t, publisher, "Expected non-nil publisher")
+	assert.Equal(t, logger, publisher.logger, "Expected logger to match")
+	assert.NotNil(t, publisher.producer, "Expected non-nil producer")
+	assert.Equal(t, config.Topic, publisher.config.Topic, "Expected topic to match")
 }
 
 func TestKafkaPublisherClose(t *testing.T) {
-	publisher := NewKafkaPublisher(zap.NewNop())
-
-	err := publisher.Close()
-	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
-	}
+	publisher, err := NewKafkaPublisher(zap.NewNop())
+	assert.NoError(t, err)
 
 	err = publisher.Close()
-	if err != nil {
-		t.Errorf("Expected no error on second close, got %v", err)
-	}
-}
-
-func TestKafkaPublisherCloseNilWriter(t *testing.T) {
-	publisher := &KafkaPublisher{
-		logger: zap.NewNop(),
-		writer: nil,
-	}
-
-	err := publisher.Close()
-	if err != nil {
-		t.Errorf("Expected no error with nil writer, got %v", err)
-	}
+	assert.NoError(t, err, "Expected no error on first close")
 }
 
 func TestBuildKafkaHeaders(t *testing.T) {
-	publisher := NewKafkaPublisher(zap.NewNop())
+	publisher, err := NewKafkaPublisher(zap.NewNop())
+	assert.NoError(t, err)
+	defer publisher.Close()
 
 	event := EventRecord{
 		EventID:       "test-event-id",
@@ -201,25 +110,19 @@ func TestBuildKafkaHeaders(t *testing.T) {
 		"span_id":        "test-span-id",
 	}
 
-	if len(headers) != len(expectedHeaders) {
-		t.Errorf("Expected %d headers, got %d", len(expectedHeaders), len(headers))
-	}
+	assert.Equal(t, len(expectedHeaders), len(headers))
 
 	for _, header := range headers {
 		expectedValue, exists := expectedHeaders[header.Key]
-		if !exists {
-			t.Errorf("Unexpected header key: %s", header.Key)
-			continue
-		}
-
-		if string(header.Value) != expectedValue {
-			t.Errorf("Expected header %s value %s, got %s", header.Key, expectedValue, string(header.Value))
-		}
+		assert.True(t, exists, "Unexpected header key: %s", header.Key)
+		assert.Equal(t, expectedValue, string(header.Value), "Header value mismatch")
 	}
 }
 
 func TestBuildKafkaHeadersWithoutTraceInfo(t *testing.T) {
-	publisher := NewKafkaPublisher(zap.NewNop())
+	publisher, err := NewKafkaPublisher(zap.NewNop())
+	assert.NoError(t, err)
+	defer publisher.Close()
 
 	event := EventRecord{
 		EventID:       "test-event-id",
@@ -239,19 +142,11 @@ func TestBuildKafkaHeadersWithoutTraceInfo(t *testing.T) {
 		"aggregate_id":   "test-aggregate-id",
 	}
 
-	if len(headers) != len(expectedHeaders) {
-		t.Errorf("Expected %d headers, got %d", len(expectedHeaders), len(headers))
-	}
+	assert.Equal(t, len(expectedHeaders), len(headers))
 
 	for _, header := range headers {
 		expectedValue, exists := expectedHeaders[header.Key]
-		if !exists {
-			t.Errorf("Unexpected header key: %s", header.Key)
-			continue
-		}
-
-		if string(header.Value) != expectedValue {
-			t.Errorf("Expected header %s value %s, got %s", header.Key, expectedValue, string(header.Value))
-		}
+		assert.True(t, exists, "Unexpected header key: %s", header.Key)
+		assert.Equal(t, expectedValue, string(header.Value), "Header value mismatch")
 	}
 }
